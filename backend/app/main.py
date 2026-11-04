@@ -57,3 +57,6 @@ def health_check():
 
 from app.routers import auth as auth_router
 app.include_router(auth_router.router)
+
+from app.routers import movies as movies_router
+app.include_router(movies_router.router)
