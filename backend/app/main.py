@@ -54,3 +54,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/api/health", tags=["Health"])
 def health_check():
     return {"status": "ok", "service": "FilmLog Backend API"}
+
+from app.routers import auth as auth_router
+app.include_router(auth_router.router)
