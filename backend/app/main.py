@@ -63,3 +63,6 @@ app.include_router(movies_router.router)
 
 from app.routers import watchlist as watchlist_router
 app.include_router(watchlist_router.router)
+
+from app.routers import watched as watched_router
+app.include_router(watched_router.router)
