@@ -1,132 +1,136 @@
 import json
+import os
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
-from app.config import GEMINI_API_KEY
 from app.database import get_db
 from app.models import Movie
 from app.schemas import MovieResponse, RecommendRequest, RecommendResponse
+from app import config
 
 router = APIRouter(prefix="/api/movies", tags=["Movies"])
 
-class GeminiOutputSchema(BaseModel):
-    movie_id: int = Field(..., description="ID film yang dipilih, WAJIB berasal dari daftar katalog database lokal.")
-    reasoning: str = Field(..., description="Penjelasan dalam Bahasa Indonesia mengapa film ini paling cocok dengan permintaan user.")
 
-@router.get("", response_model=List[MovieResponse], status_code=status.HTTP_200_OK)
+@router.get("", response_model=List[MovieResponse])
 def get_movies(
-    genre: Optional[str] = Query(None, description="Filter berdasarkan genre film (misal: Sci-Fi)"),
-    search: Optional[str] = Query(None, description="Cari berdasarkan judul film atau sutradara"),
+    genre: Optional[str] = Query(default=None, description="Filter berdasarkan nama genre"),
+    search: Optional[str] = Query(default=None, description="Cari berdasarkan judul atau sutradara"),
     db: Session = Depends(get_db),
 ):
-    query = db.query(Movie)
+    movies = db.query(Movie).order_by(Movie.id.asc()).all()
 
-    if search:
-        search_pattern = f"%{search.strip().lower()}%"
-        query = query.filter(
-            (Movie.title.ilike(search_pattern)) | (Movie.director.ilike(search_pattern))
-        )
-
-    movies = query.all()
-
-    if genre and genre.strip().upper() != "ALL":
+    if genre and genre.strip().lower() not in ("", "all"):
         target_genre = genre.strip().lower()
-        filtered_movies = []
-        for m in movies:
-            genres_list = [g.strip().lower() for g in (m.genres if isinstance(m.genres, list) else str(m.genres).split(","))]
-            if target_genre in genres_list:
-                filtered_movies.append(m)
-        movies = filtered_movies
+        movies = [
+            m for m in movies
+            if any(target_genre == g.lower() for g in (m.genres or []))
+        ]
+
+    if search and search.strip():
+        q = search.strip().lower()
+        movies = [
+            m for m in movies
+            if q in m.title.lower()
+            or q in m.director.lower()
+            or q in (m.synopsis or "").lower()
+        ]
 
     return movies
 
-@router.post("/recommend", response_model=RecommendResponse, status_code=status.HTTP_200_OK)
+
+class GeminiOutputSchema(BaseModel):
+    movie_id: int
+    reasoning: str
+
+
+@router.post("/recommend", response_model=RecommendResponse)
 def recommend_movie(payload: RecommendRequest, db: Session = Depends(get_db)):
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_google_ai_studio_api_key_here":
+    api_key = os.getenv("GEMINI_API_KEY") or config.GEMINI_API_KEY
+    if not api_key or api_key == "your-gemini-api-key-here":
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="GEMINI_API_KEY belum dikonfigurasi di file backend/.env",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GEMINI_API_KEY belum dikonfigurasi pada file backend/.env",
         )
 
-    movies = db.query(Movie).all()
+    movies = db.query(Movie).order_by(Movie.id.asc()).all()
     if not movies:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Database film kosong, jalankan seeder terlebih dahulu",
+            detail="Database film masih kosong.",
         )
 
-    # 1. Grounding Context: Siapkan katalog film dari database lokal
-    catalog_context = [
+    catalog_for_prompt = [
         {
             "id": m.id,
             "title": m.title,
             "year": m.year,
-            "director": m.director,
             "genres": m.genres,
             "rating": m.rating,
-            "synopsis": m.synopsis,
+            "synopsis": (m.synopsis or "")[:140],
         }
         for m in movies
     ]
     valid_ids = {m.id: m for m in movies}
 
     system_instruction = (
-        "Kamu adalah kurator film ahli untuk platform FilmLog. "
-        "ATURAN KETAT (GROUNDING): Kamu HANYA BOLEH merekomendasikan SATU film yang terdapat di dalam "
-        "DAFTAR KATALOG DATABASE LOKAL berikut ini. Dilarang keras mengarang atau memilih film di luar daftar ini.\n\n"
-        f"DAFTAR KATALOG DATABASE LOKAL:\n{json.dumps(catalog_context, ensure_ascii=False, indent=2)}\n\n"
-        "Pilih tepat satu film (movie_id) dari daftar di atas yang paling sesuai dengan suasana/deskripsi yang diminta user, "
-        "dan berikan alasan (reasoning) yang menarik dalam Bahasa Indonesia."
+        "Anda adalah kurator film FilmLog. "
+        "ATURAN GROUNDING: Pilih TEPAT SATU film HANYA dari daftar JSON di bawah ini. "
+        "DILARANG memilih film di luar daftar. "
+        "Kembalikan JSON sesuai skema berisi 'movie_id' (int) dan 'reasoning' (2 kalimat alasan menarik).\n"
+        f"KATALOG:\n{json.dumps(catalog_for_prompt, ensure_ascii=False, separators=(',', ':'))}"
     )
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key.strip())
+
         response = client.models.generate_content(
-    model="gemini-3.7-flash",
-    contents=f"Permintaan User: {payload.prompt}",
-    config=types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        response_mime_type="application/json",
-        response_schema=GeminiOutputSchema,
-    ),
-)
-
-        result_json = json.loads(response.text)
-        chosen_id = int(result_json.get("movie_id"))
-        reasoning = result_json.get("reasoning", "").strip()
-
-        # 3. Post-Generation Verification: Pastikan ID benar-benar ada di database lokal
-        if chosen_id not in valid_ids:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"AI mengembalikan movie_id ({chosen_id}) di luar katalog database lokal",
-            )
-
-        matched_movie = valid_ids[chosen_id]
-        return RecommendResponse(
-            movie_id=matched_movie.id,
-            movieId=matched_movie.id,
-            reasoning=reasoning,
-            movie=MovieResponse.model_validate(matched_movie),
+            model="gemini-3-flash-preview",
+            contents=f"Permintaan user: {payload.prompt}",
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=GeminiOutputSchema,
+                temperature=0.2,
+            ),
         )
+
+        if not response or not response.text:
+            raise RuntimeError("Respons kosong dari Gemini AI.")
+
+        parsed_data = json.loads(response.text)
+        chosen_id = int(parsed_data.get("movie_id"))
+        reasoning = parsed_data.get("reasoning", "").strip()
+
+        chosen_movie = valid_ids.get(chosen_id, movies[0])
+        movie_schema = MovieResponse.model_validate(chosen_movie)
+
+        return RecommendResponse(
+            movie=movie_schema,
+            recommendation=reasoning,
+            reason=reasoning,
+            explanation=reasoning,
+        )
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Gagal menghubungi layanan Gemini AI: {str(e)}",
+            detail=f"Gagal memanggil layanan Gemini AI: {str(e)}",
         )
 
-@router.get("/{movie_id}", response_model=MovieResponse, status_code=status.HTTP_200_OK)
+
+@router.get("/{movie_id}", response_model=MovieResponse)
 def get_movie_detail(movie_id: int, db: Session = Depends(get_db)):
     movie = db.query(Movie).filter(Movie.id == movie_id).first()
     if not movie:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Film dengan ID {movie_id} tidak ditemukan",
+            detail=f"Film dengan ID {movie_id} tidak ditemukan.",
         )
     return movie
