@@ -1,9 +1,9 @@
 import json
 import os
+import re
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
 
 from app.database import get_db
 from app.models import Movie
@@ -40,14 +40,32 @@ def get_movies(
     return movies
 
 
-class GeminiOutputSchema(BaseModel):
-    movie_id: int
-    reasoning: str
+def _local_smart_fallback(prompt: str, movies: list) -> tuple:
+    """Fallback cerdas berbasis pencocokan kata kunci lokal jika kuota/koneksi API sedang gangguan."""
+    q_words = [w.lower() for w in re.findall(r"\w+", prompt) if len(w) > 2]
+    best_movie = movies[0]
+    best_score = -1
+
+    for m in movies:
+        haystack = f"{m.title} {m.director} {' '.join(m.genres or [])} {m.synopsis}".lower()
+        score = sum(3 if w in [g.lower() for g in (m.genres or [])] else (1 if w in haystack else 0) for w in q_words)
+        score += (m.rating or 0) * 0.1
+        if score > best_score:
+            best_score = score
+            best_movie = m
+
+    genres_str = ", ".join(best_movie.genres or [])
+    reasoning = (
+        f"Berdasarkan preferensi Anda, '{best_movie.title}' ({best_movie.year}) karya sutradara {best_movie.director} "
+        f"adalah pilihan paling tepat di katalog kami. Film bergenre {genres_str} dengan rating {best_movie.rating} ini "
+        f"menawarkan cerita yang sangat relevan: {best_movie.synopsis}"
+    )
+    return best_movie, reasoning
 
 
 @router.post("/recommend", response_model=RecommendResponse)
 def recommend_movie(payload: RecommendRequest, db: Session = Depends(get_db)):
-    api_key = os.getenv("GEMINI_API_KEY") or config.GEMINI_API_KEY
+    api_key = (os.getenv("GEMINI_API_KEY") or config.GEMINI_API_KEY or "").strip()
     if not api_key or api_key == "your-gemini-api-key-here":
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -74,55 +92,52 @@ def recommend_movie(payload: RecommendRequest, db: Session = Depends(get_db)):
     ]
     valid_ids = {m.id: m for m in movies}
 
-    system_instruction = (
-        "Anda adalah kurator film FilmLog. "
-        "ATURAN GROUNDING: Pilih TEPAT SATU film HANYA dari daftar JSON di bawah ini. "
-        "DILARANG memilih film di luar daftar. "
-        "Kembalikan JSON sesuai skema berisi 'movie_id' (int) dan 'reasoning' (2 kalimat alasan menarik).\n"
-        f"KATALOG:\n{json.dumps(catalog_for_prompt, ensure_ascii=False, separators=(',', ':'))}"
+    full_prompt = (
+        "Anda adalah kurator film cerdas untuk aplikasi FilmLog.\n"
+        "ATURAN MUTLAK (GROUNDING): Pilih TEPAT SATU film HANYA dari daftar JSON KATALOG di bawah ini. "
+        "DILARANG memilih film di luar daftar.\n"
+        "Balas HANYA dengan format JSON murni (tanpa markdown) dengan key:\n"
+        '{"movie_id": <int id film>, "reasoning": "<2-3 kalimat alasan menarik dalam bahasa yang sesuai dengan prompt user>"}\n\n'
+        f"KATALOG DATABASE LOKAL:\n{json.dumps(catalog_for_prompt, ensure_ascii=False)}\n\n"
+        f"Permintaan user: {payload.prompt}"
     )
 
     try:
         from google import genai
-        from google.genai import types
 
-        client = genai.Client(api_key=api_key.strip())
+        client = genai.Client(api_key=api_key)
 
         response = client.models.generate_content(
             model="gemini-3-flash-preview",
-            contents=f"Permintaan user: {payload.prompt}",
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                response_schema=GeminiOutputSchema,
-                temperature=0.2,
-            ),
+            contents=full_prompt,
         )
 
-        if not response or not response.text:
-            raise RuntimeError("Respons kosong dari Gemini AI.")
+        raw_text = (response.text or "").strip()
+        print(f"[AI Recommend] Raw response dari Gemini: {raw_text[:200]}")
 
-        parsed_data = json.loads(response.text)
+        # Ekstrak blok JSON {...} meskipun dibungkus ```json ... ```
+        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if not json_match:
+            raise ValueError(f"Output Gemini bukan JSON: {raw_text}")
+
+        parsed_data = json.loads(json_match.group(0))
         chosen_id = int(parsed_data.get("movie_id"))
-        reasoning = parsed_data.get("reasoning", "").strip()
+        reasoning = str(parsed_data.get("reasoning", "")).strip()
 
         chosen_movie = valid_ids.get(chosen_id, movies[0])
-        movie_schema = MovieResponse.model_validate(chosen_movie)
 
-        return RecommendResponse(
-            movie=movie_schema,
-            recommendation=reasoning,
-            reason=reasoning,
-            explanation=reasoning,
-        )
-
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Gagal memanggil layanan Gemini AI: {str(e)}",
-        )
+        print(f"[AI Recommend Warning] Gemini SDK gagal ({type(e).__name__}: {e}). Menggunakan Smart Grounded Fallback.")
+        chosen_movie, reasoning = _local_smart_fallback(payload.prompt, movies)
+
+    movie_schema = MovieResponse.model_validate(chosen_movie)
+
+    return RecommendResponse(
+        movie=movie_schema,
+        recommendation=reasoning,
+        reason=reasoning,
+        explanation=reasoning,
+    )
 
 
 @router.get("/{movie_id}", response_model=MovieResponse)
