@@ -7,7 +7,7 @@
 // 1. STATE MANAGEMENT
 // ==========================================
 const state = {
-  apiBaseUrl: localStorage.getItem('filmlog_api_url') || 'http://localhost:8000/api',
+  apiBaseUrl: (window.location.protocol.startsWith('http') ? window.location.origin + '/api' : (localStorage.getItem('filmlog_api_url') || 'http://localhost:8000/api')),
   token: localStorage.getItem('filmlog_token') || null,
   user: JSON.parse(localStorage.getItem('filmlog_user') || 'null'),
   currentTab: 'discover',

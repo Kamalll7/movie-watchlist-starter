@@ -3,7 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 from app.database import Base, engine
 from seed import seed_movies
@@ -47,23 +47,37 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"detail": detail_msg, "message": detail_msg, "errors": errors},
     )
 
-@app.get("/", include_in_schema=False)
-def serve_frontend():
-    candidates = [
-        Path(__file__).resolve().parent.parent / "index.html",
-        Path(__file__).resolve().parent.parent.parent / "frontend" / "index.html",
-        Path(__file__).resolve().parent.parent.parent / "index.html",
-    ]
-    for html_path in candidates:
-        if html_path.exists():
-            return HTMLResponse(content=html_path.read_text(encoding="utf-8"), status_code=200)
-    return {"status": "ok", "message": "FilmLog Backend API is running. Visit /docs for Swagger UI or /api/movies."}
-
 @app.get("/api/health", tags=["Health"])
 def health_check():
     return {"status": "ok", "service": "FilmLog Backend API"}
 
+# Daftarkan semua router API (/api/...)
 app.include_router(auth_router.router)
 app.include_router(movies_router.router)
 app.include_router(watchlist_router.router)
 app.include_router(watched_router.router)
+
+def find_frontend_dir() -> Path:
+    base = Path(__file__).resolve().parent.parent
+    for candidate in [base / "static_frontend", base.parent / "frontend"]:
+        if candidate.exists() and (candidate / "index.html").exists():
+            return candidate
+    return base / "static_frontend"
+
+@app.get("/", include_in_schema=False)
+def serve_index():
+    frontend_dir = find_frontend_dir()
+    index_file = frontend_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file, media_type="text/html")
+    return {"status": "ok", "message": "FilmLog Backend API is running. Visit /docs"}
+
+@app.get("/app.js", include_in_schema=False)
+def serve_js():
+    js_file = find_frontend_dir() / "app.js"
+    return FileResponse(js_file, media_type="application/javascript")
+
+@app.get("/styles.css", include_in_schema=False)
+def serve_css():
+    css_file = find_frontend_dir() / "styles.css"
+    return FileResponse(css_file, media_type="text/css")
