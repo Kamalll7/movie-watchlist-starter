@@ -59,6 +59,7 @@ def recommend_movie(payload: RecommendRequest, db: Session = Depends(get_db)):
             detail="Database film kosong, jalankan seeder terlebih dahulu",
         )
 
+    # 1. Grounding Context: Siapkan katalog film dari database lokal
     catalog_context = [
         {
             "id": m.id,
@@ -85,20 +86,20 @@ def recommend_movie(payload: RecommendRequest, db: Session = Depends(get_db)):
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=f"Permintaan User: {payload.prompt}",
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                response_schema=GeminiOutputSchema,
-                temperature=0.2,
-            ),
-        )
+    model="gemini-3.7-flash",
+    contents=f"Permintaan User: {payload.prompt}",
+    config=types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        response_mime_type="application/json",
+        response_schema=GeminiOutputSchema,
+    ),
+)
 
         result_json = json.loads(response.text)
         chosen_id = int(result_json.get("movie_id"))
         reasoning = result_json.get("reasoning", "").strip()
 
+        # 3. Post-Generation Verification: Pastikan ID benar-benar ada di database lokal
         if chosen_id not in valid_ids:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
